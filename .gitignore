@@ -1,0 +1,21 @@
+# Secrets — NEVER commit this. Real API keys live here.
+.env
+
+# Local trading data / logs — not source code, and some entries could
+# reveal account-specific info you may not want public
+trade_journal.jsonl
+positions_opened_log.json
+debug_market_data_*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+*.egg-info/
+
+# IDE / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
