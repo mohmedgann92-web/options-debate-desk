@@ -116,8 +116,23 @@ WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "NFLX",
     # Other liquid large caps with active options markets
     "JPM", "BAC", "XOM", "DIS", "CRM", "ORCL", "COST", "WMT", "UNH", "V",
-    # Broad index / sector ETFs — usually lower vol, useful diversification
-    "SPY", "QQQ", "IWM", "XLF", "XLE",
+    # Semiconductors — different demand drivers than NVDA/AMD (memory,
+    # networking, industrial chips), all genuinely liquid options
+    "QCOM", "TXN", "MU", "INTC",
+    # Financials — rounds JPM/BAC/V out into real sector breadth
+    "GS", "MS", "WFC", "C", "MA",
+    # Healthcare — its own news cycle (drug trials, FDA events),
+    # uncorrelated with tech/macro. LLY specifically has very active options.
+    "PFE", "JNJ", "ABBV", "LLY",
+    # Consumer discretionary — different demand drivers (housing, apparel,
+    # dining, discount retail) than WMT/COST alone
+    "HD", "NKE", "SBUX", "MCD", "TGT",
+    # Consistently (not just occasionally) active options volume — good
+    # scanner candidates for a genuine, non-outlier IV/RV edge
+    "PYPL", "SHOP", "UBER", "COIN", "PLTR",
+    # Broad index / sector / asset-class ETFs — GLD/TLT specifically add
+    # exposure to macro drivers (gold, rates) with no equity correlation
+    "SPY", "QQQ", "IWM", "XLF", "XLE", "XLK", "XLV", "GLD", "TLT",
 ]
 
 # Liquidity filter used by get_iv_edge() when scoring near-ATM contracts.

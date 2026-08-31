@@ -1466,11 +1466,16 @@ if st.session_state["continuous_history"]:
                          use_container_width=True)
 
 if st.session_state["continuous_active"]:
-    # Short poll instead of sleeping the full interval, so the Stop button
-    # (and any other sidebar change) takes effect within a few seconds
-    # rather than only at the next scheduled run.
+    # Poll every 15s rather than every 3s — the original 3s interval made
+    # the Stop button feel responsive, but its real cost was a FULL PAGE
+    # rerun every 3 seconds while continuous mode ran, which re-rendered
+    # everything on screen (including whatever results you were trying to
+    # read) constantly. Found via a screen recording showing exactly this.
+    # 15s worst-case Stop latency is a fine tradeoff for a bot that only
+    # actually acts once an hour — lower this back toward 3.0 if you'd
+    # rather prioritize Stop responsiveness over a calmer screen.
     remaining = max(0.0, (st.session_state["next_run_at"] - datetime.now()).total_seconds())
-    time.sleep(min(3.0, remaining) if remaining > 0 else 0.5)
+    time.sleep(min(15.0, remaining) if remaining > 0 else 0.5)
     st.rerun()
 
 if st.session_state.get("last_result"):

@@ -412,6 +412,71 @@ async def get_held_underlying_symbols(client: AlpacaMCPClient) -> set[str]:
         return set()
 
 
+async def get_open_positions(client: AlpacaMCPClient) -> list[dict]:
+    """
+    Returns full position details for display (e.g. the dashboard's Open
+    Positions table) — symbol, underlying, option type/strike/expiry, days
+    to expiry, side, qty, avg entry, current price, market value, and
+    unrealized P&L. This is the richer counterpart to
+    get_held_underlying_symbols() (which only returns a bare set of
+    underlying tickers for the "already holding" check) — the dashboard
+    needs full detail per position, not just which tickers are held.
+
+    Uses the same real response shape confirmed live earlier (get_all_positions
+    wraps its list under data.result; numeric fields come back as strings
+    and need explicit float conversion; OCC-format symbols need parsing for
+    strike/expiry/type, same as get_held_underlying_symbols does for the
+    root ticker alone). Fails open — returns an empty list on any parse
+    error rather than raising, since a failed position fetch shouldn't
+    crash a dashboard that already handles an empty result gracefully.
+    """
+    def _float_or_none(value) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        result = await client.call_tool("get_all_positions", {})
+        data = _data(result)
+        raw_positions = data if isinstance(data, list) else data.get("positions", data.get("result", []))
+    except Exception:
+        return []
+
+    positions = []
+    for p in raw_positions:
+        symbol = p.get("symbol", "")
+        try:
+            parsed = bs.parse_occ_symbol(symbol)
+            underlying = parsed["root"]
+            option_type = parsed["option_type"]
+            strike = parsed["strike"]
+            expiry = str(parsed["expiry"])
+            dte = bs.days_to_expiry(parsed["expiry"])
+        except ValueError:
+            # Not an OCC-format symbol — a plain equity position.
+            underlying, option_type, strike, expiry, dte = symbol, None, None, None, None
+
+        positions.append({
+            "symbol": symbol,
+            "underlying": underlying,
+            "option_type": option_type,
+            "strike": strike,
+            "expiry": expiry,
+            "days_to_expiry": dte,
+            "side": p.get("side"),
+            "qty": _float_or_none(p.get("qty")) or 0.0,
+            "avg_entry_price": _float_or_none(p.get("avg_entry_price")) or 0.0,
+            "current_price": _float_or_none(p.get("current_price")) or 0.0,
+            "market_value": _float_or_none(p.get("market_value")) or 0.0,
+            "unrealized_pl": _float_or_none(p.get("unrealized_pl")),
+            "unrealized_plpc": _float_or_none(p.get("unrealized_plpc")),
+        })
+    return positions
+
+
 async def get_symbols_with_open_orders(client: AlpacaMCPClient) -> set[str]:
     """
     Returns underlying tickers with a currently OPEN (submitted but not yet

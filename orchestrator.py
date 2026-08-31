@@ -16,7 +16,7 @@ import risk_governor
 import position_tracker
 import trade_journal
 from mcp_client import AlpacaMCPClient
-from agents import bull, bear, risk_manager, decision
+from agents import bull, bear, risk_manager, decision, consistency_check
 
 console = Console()
 
@@ -134,11 +134,22 @@ async def _run_debate_with_client(client: AlpacaMCPClient, symbol: str, execute:
     console.print(f"[dim]Raw market data saved to {saved_path} — inspect this to verify any "
                   f"number an agent cites.[/dim]")
     agent_data = _build_agent_payload(market_data)
+    # Built early (not just before the Risk Governor, where this used to
+    # live) so the consistency check below can use it too — same lookup,
+    # single source of truth, no duplicate construction.
+    chain_by_symbol = _build_chain_lookup(market_data["option_chain_sample"])
 
     console.print(Panel(f"[bold]Options Alpha Debate Desk[/bold] — {symbol}", style="cyan"))
 
     console.print("[bold green]BULL agent thinking...[/bold green]")
     bull_case = bull.run(agent_data)
+    bull_case = consistency_check.verify(bull_case, chain_by_symbol, "Bull")
+    if bull_case["consistency_check"] == "corrected":
+        console.print("[bold yellow]⚠ Bull's narrative didn't match its own legs — "
+                      "corrected before Risk Manager saw it.[/bold yellow]")
+    elif bull_case["consistency_check"] == "correction_rejected_changed_legs":
+        console.print("[bold red]⚠ Consistency check tried to alter Bull's actual legs — "
+                      "rejected; original proposal kept as-is.[/bold red]")
     console.print(Panel(Markdown(f"**Thesis:** {bull_case['thesis']}\n\n"
                                   f"**Strategy:** {bull_case['strategy']}\n\n"
                                   f"**Confidence:** {bull_case['confidence']} — {bull_case['confidence_reason']}"),
@@ -146,6 +157,13 @@ async def _run_debate_with_client(client: AlpacaMCPClient, symbol: str, execute:
 
     console.print("[bold red]BEAR agent thinking...[/bold red]")
     bear_case = bear.run(agent_data)
+    bear_case = consistency_check.verify(bear_case, chain_by_symbol, "Bear")
+    if bear_case["consistency_check"] == "corrected":
+        console.print("[bold yellow]⚠ Bear's narrative didn't match its own legs — "
+                      "corrected before Risk Manager saw it.[/bold yellow]")
+    elif bear_case["consistency_check"] == "correction_rejected_changed_legs":
+        console.print("[bold red]⚠ Consistency check tried to alter Bear's actual legs — "
+                      "rejected; original proposal kept as-is.[/bold red]")
     console.print(Panel(Markdown(f"**Thesis:** {bear_case['thesis']}\n\n"
                                   f"**Strategy:** {bear_case['strategy']}\n\n"
                                   f"**Confidence:** {bear_case['confidence']} — {bear_case['confidence_reason']}"),
@@ -169,7 +187,6 @@ async def _run_debate_with_client(client: AlpacaMCPClient, symbol: str, execute:
                          title="✅ Final Decision", style="bold cyan"))
 
     governor_result = {"approved": False, "violations": [], "notes": []}
-    chain_by_symbol = _build_chain_lookup(market_data["option_chain_sample"])
 
     if final.get("legs"):
         fact_check_lines = _fact_check_legs(final, chain_by_symbol)
