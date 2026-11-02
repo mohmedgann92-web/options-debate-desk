@@ -136,6 +136,58 @@ class TestTickMechanics(Base):
         self.assertTrue(any(l.startswith("WARN BAD") for l in out))
 
 
+class TestCalendarAndPlan(Base):
+    def at(self, iso):
+        return datetime.fromisoformat(iso)
+
+    def test_holiday_and_weekend_not_trading(self):
+        self.assertEqual(self.m.cmd_plan(self.at("2026-11-26T13:41:00+00:00"), 5),
+                         {"date_et": "2026-11-26", "trading_day": False, "reason": "NYSE holiday"})
+        self.assertFalse(self.m.cmd_plan(self.at("2026-11-07T13:41:00+00:00"), 5)["trading_day"])
+
+    def test_tick_on_holiday_is_closed(self):
+        out = self.tick({"NASDAQ:XYZ": {"close": 1, "volume": 1, "high": 1, "low": 1}},
+                        self.at("2026-12-25T16:00:00+00:00"))
+        self.assertIn("market closed", out[0])
+
+    def test_regular_day_plan(self):
+        p = self.m.cmd_plan(self.at("2026-11-03T13:41:00+00:00"), 5)
+        self.assertEqual(p["ticks_expected"], 78)
+        self.assertEqual(p["session_et"], "09:30-16:00")
+        self.assertTrue(all(c.endswith(" 3 11 *") for c in p["tick_crons"]))   # pinned to the day
+
+    def test_early_close_day(self):
+        p = self.m.cmd_plan(self.at("2026-11-27T13:41:00+00:00"), 5)
+        self.assertEqual(p["session_et"], "09:30-13:00")
+        self.assertEqual(p["ticks_expected"], 42)
+        # A tick at 1:30 PM ET is outside the early-close session.
+        out = self.tick({"NASDAQ:XYZ": {"close": 1, "volume": 1, "high": 1, "low": 1}},
+                        self.at("2026-11-27T18:30:00+00:00"))
+        self.assertIn("market closed", out[0])
+
+    def test_plan_tick_count_matches_expected(self):
+        """Every cron minute generated must be one of the expected tick times."""
+        p = self.m.cmd_plan(self.at("2026-11-03T13:41:00+00:00"), 5)
+        n = 0
+        for expr in p["tick_crons"]:
+            mins, hours = expr.split()[:2]
+            h0, h1 = (map(int, hours.split("-")) if "-" in hours else (int(hours), int(hours)))
+            n += len(mins.split(",")) * (h1 - h0 + 1)
+        self.assertEqual(n, p["ticks_expected"])
+
+    def test_summary_counts_todays_alerts_and_ticks(self):
+        T = self.at("2026-11-03T15:00:05+00:00")
+        self.tick({"NASDAQ:XYZ": {"close": 1, "volume": 1, "high": 1, "low": 1}}, T)
+        os.makedirs(self.m.STATE_DIR, exist_ok=True)
+        with open(self.m.LOG_FILE, "w") as f:
+            f.write(json.dumps({"symbol": "XYZ", "kind": "break_up", "bar_time": "2026-11-03T15:00:00+00:00"}) + "\n")
+            f.write(json.dumps({"symbol": "OLD", "kind": "break_up", "bar_time": "2026-11-02T15:00:00+00:00"}) + "\n")
+        s = self.m.cmd_summary(T)
+        self.assertIn("1 alert(s), 1 ticks run", s)
+        self.assertIn("XYZ VWAP RECLAIM", s)
+        self.assertNotIn("OLD", s)
+
+
 class TestSeed(Base):
     def test_seed_sets_vwap_for_midday_start(self):
         now = datetime(2026, 11, 3, 17, 0, tzinfo=timezone.utc)        # 12:00 ET

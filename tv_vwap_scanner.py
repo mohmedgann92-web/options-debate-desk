@@ -122,14 +122,40 @@ def short(sym: str) -> str:
     return sym.split(":")[-1]
 
 
+# NYSE calendar, from nyse.com/markets/hours-calendars and ICE's 2024-11-08
+# holiday press release. Extend when NYSE publishes later years.
+NYSE_HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+    "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29", "2028-06-19", "2028-07-04",
+    "2028-09-04", "2028-11-23", "2028-12-25",
+}
+NYSE_EARLY_CLOSE = {"2026-11-27", "2026-12-24", "2027-11-26", "2028-07-03", "2028-11-24"}   # 1:00 PM ET
+CALENDAR_LAST_YEAR = 2028
+
+
 def session_bounds(day_et: datetime) -> tuple[datetime, datetime]:
+    close_h = 13 if day_et.date().isoformat() in NYSE_EARLY_CLOSE else 16
     return (day_et.replace(hour=9, minute=30, second=0, microsecond=0),
-            day_et.replace(hour=16, minute=0, second=0, microsecond=0))
+            day_et.replace(hour=close_h, minute=0, second=0, microsecond=0))
+
+
+def is_trading_day(day_et: datetime) -> tuple[bool, str]:
+    d = day_et.date()
+    if d.weekday() >= 5:
+        return False, "weekend"
+    if d.isoformat() in NYSE_HOLIDAYS:
+        return False, "NYSE holiday"
+    if d.year > CALENDAR_LAST_YEAR:
+        return True, f"weekday (holiday calendar only covers through {CALENDAR_LAST_YEAR})"
+    return True, "early close 1:00 PM ET" if d.isoformat() in NYSE_EARLY_CLOSE else "regular session"
 
 
 def in_session(now_et: datetime) -> bool:
     o, c = session_bounds(now_et)
-    return now_et.weekday() < 5 and o <= now_et < c
+    return is_trading_day(now_et)[0] and o <= now_et < c
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +239,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
         state = {"day": today, "symbols": {}, "seeds": {
             k: v for k, v in state.get("seeds", {}).items() if v.get("day") == today}}
 
+    state["ticks"] = state.get("ticks", 0) + 1
     alerts = 0
     for sym, snap in sorted(data.items()):
         if not isinstance(snap, dict) or snap.get("close") is None or snap.get("volume") is None:
@@ -294,6 +321,61 @@ def cmd_seed(symbol: str, payload: dict, now: datetime) -> str:
     return f"SEEDED {symbol.upper()} from {used} bars: VWAP {vwap:.2f} σ {sd:.2f}"
 
 
+def cmd_plan(now: datetime, interval: int) -> dict:
+    """Today's tick times as cron expressions in THIS MACHINE'S local time
+    (what CronCreate uses), pinned to today's date so a job can never fire
+    on a later day. Handles DST, holidays and early closes, because it is
+    computed fresh each morning from the America/New_York calendar."""
+    now_et = now.astimezone(ET)
+    ok, reason = is_trading_day(now_et)
+    plan = {"date_et": now_et.date().isoformat(), "trading_day": ok, "reason": reason}
+    if not ok:
+        return plan
+    open_et, close_et = session_bounds(now_et)
+    local = datetime.now().astimezone().tzinfo
+    # First tick 1 min after the open, then every `interval` minutes; the
+    # last one lands before the close.
+    times, t = [], open_et + timedelta(minutes=1)
+    while t < close_et:
+        times.append(t.astimezone(local))
+        t += timedelta(minutes=interval)
+    by_hour: dict[tuple, list[int]] = {}
+    for lt in times:
+        by_hour.setdefault((lt.day, lt.month, lt.hour), []).append(lt.minute)
+    # Merge consecutive hours that share the same minute list into one job.
+    groups: list[tuple] = []
+    for (d, m, h), mins in by_hour.items():
+        key = ",".join(map(str, mins))
+        if groups and groups[-1][0] == key and groups[-1][1] == (d, m) and groups[-1][3] == h - 1:
+            groups[-1] = (key, (d, m), groups[-1][2], h)
+        else:
+            groups.append((key, (d, m), h, h))
+    plan["tick_crons"] = [f"{mins} {h0 if h0 == h1 else f'{h0}-{h1}'} {d} {m} *"
+                          for mins, (d, m), h0, h1 in groups]
+    end = (close_et + timedelta(minutes=5)).astimezone(local)
+    plan["end_cron"] = f"{end.minute} {end.hour} {end.day} {end.month} *"
+    plan["session_et"] = f"{open_et:%H:%M}-{close_et:%H:%M}"
+    plan["ticks_expected"] = len(times)
+    return plan
+
+
+def cmd_summary(now: datetime) -> str:
+    state = load_state()
+    day = state.get("day") or now.astimezone(ET).date().isoformat()
+    alerts = []
+    try:
+        with open(LOG_FILE, encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                if datetime.fromisoformat(r["bar_time"]).astimezone(ET).date().isoformat() == day:
+                    alerts.append(f"{r['symbol']} {LABEL[r['kind']]}")
+    except OSError:
+        pass
+    shown = "; ".join(alerts[:8]) + (" …" if len(alerts) > 8 else "")
+    return (f"VWAP scanner {day} done: {len(alerts)} alert(s), {state.get('ticks', 0)} ticks run"
+            + (f" — {shown}" if alerts else ""))
+
+
 def cmd_status(now: datetime) -> list[str]:
     from vwap_signals import vwap_series
     state = load_state()
@@ -320,6 +402,10 @@ def main() -> None:
     s.add_argument("symbol")
     s.add_argument("--now", help="ISO timestamp override (testing)")
     sub.add_parser("status")
+    pl = sub.add_parser("plan", help="today's tick schedule as cron expressions in this machine's local time")
+    pl.add_argument("--interval", type=int, default=5)
+    pl.add_argument("--now", help="ISO timestamp override (testing)")
+    sub.add_parser("summary", help="one-line end-of-day summary")
     sub.add_parser("reset")
     args = ap.parse_args()
 
@@ -328,6 +414,10 @@ def main() -> None:
         print("\n".join(cmd_tick(json.load(sys.stdin), now, params_for(args.interval), args.interval)))
     elif args.cmd == "seed":
         print(cmd_seed(args.symbol, json.load(sys.stdin), now))
+    elif args.cmd == "plan":
+        print(json.dumps(cmd_plan(now, args.interval), indent=2))
+    elif args.cmd == "summary":
+        print(cmd_summary(now))
     elif args.cmd == "status":
         print("\n".join(cmd_status(now)))
     elif args.cmd == "reset":
