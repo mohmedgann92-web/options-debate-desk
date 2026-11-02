@@ -557,3 +557,23 @@ python -m unittest discover -s tests -v
   crossing VWAP back and forth.
 - Alerts are logged to `vwap_signals.jsonl`. They're reference levels, not
   trade instructions.
+
+### Real-time variant: TradingView connector + phone push (`tv_vwap_scanner.py`)
+
+Alpaca's free bars are IEX-only and partly delayed, so this variant runs on
+TradingView's streaming quotes, which Claude pulls through the TradingView
+connector. Only Claude can call the connector, so the scanner runs as a
+recurring Claude task in a Claude Code session. Each minute Claude makes one
+`get_symbol_data_batch` call for all tickers, pipes the result into
+`python3 tv_vwap_scanner.py tick`, and sends each `ALERT` line to your phone
+as a push notification.
+
+The quote's cumulative **consolidated** volume is differenced between
+snapshots, so the VWAP covers the full tape, not one exchange. Per-minute
+bars are rebuilt from the snapshots. Intra-minute wicks are only seen when
+they set a new day high or low, so bounce alerts are a little stricter than
+on a bar chart, while breaks are unaffected. In a replay of 2026-11-02 SPY,
+the VWAP loss fired at 10:59 ET and the session VWAP matched 758.98 exactly.
+If you start the scanner mid-session, seed each ticker first with today's
+5-minute bars (`tv_vwap_scanner.py seed SPY < bars.json`). State is kept in
+`.vwap_state/`.

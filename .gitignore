@@ -21,3 +21,4 @@ venv/
 Thumbs.db
 # VWAP scanner alert log
 vwap_signals.jsonl
+.vwap_state/

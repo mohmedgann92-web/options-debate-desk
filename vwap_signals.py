@@ -109,12 +109,19 @@ class Signal:
 # Indicators
 # ---------------------------------------------------------------------------
 
-def vwap_series(bars: list[Bar]) -> list[tuple[float, float]]:
+def vwap_series(bars: list[Bar], seed: tuple[float, float, float] | None = None) -> list[tuple[float, float]]:
     """Cumulative session VWAP and volume-weighted standard deviation at
-    each bar. Bars with zero volume carry the previous values forward."""
+    each bar. Bars with zero volume carry the previous values forward.
+
+    `seed` = (sum p*v, sum v, sum p*p*v) for session volume that traded
+    BEFORE the first bar in `bars` (e.g. when the scanner starts mid-day)."""
     out = []
-    pv = vol = pv2 = 0.0
-    last = (bars[0].price if bars else 0.0, 0.0)
+    pv, vol, pv2 = seed if seed else (0.0, 0.0, 0.0)
+    if vol > 0:
+        v0 = pv / vol
+        last = (v0, math.sqrt(max(pv2 / vol - v0 * v0, 0.0)))
+    else:
+        last = (bars[0].price if bars else 0.0, 0.0)
     for b in bars:
         if b.v > 0:
             p = b.price
@@ -163,7 +170,8 @@ def _avg_volume(bars: list[Bar], end: int, n: int) -> float:
 # Detection
 # ---------------------------------------------------------------------------
 
-def detect(symbol: str, bars: list[Bar], p: Params | None = None) -> list[Signal]:
+def detect(symbol: str, bars: list[Bar], p: Params | None = None,
+           seed: tuple[float, float, float] | None = None) -> list[Signal]:
     """Evaluate ONLY the last bar in `bars` (which must be a completed bar)
     and return any signals it triggers. Call it once per new completed bar;
     pass the whole session so far so VWAP is correct."""
@@ -174,7 +182,7 @@ def detect(symbol: str, bars: list[Bar], p: Params | None = None) -> list[Signal
     if n < need:
         return []
 
-    vw = vwap_series(bars)
+    vw = vwap_series(bars, seed)
     last = bars[-1]
     vwap, sd = vw[-1]
     if vwap <= 0:
