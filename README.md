@@ -529,3 +529,31 @@ LIQUIDITY_CONFIG = {
 This is a hackathon project, not investment advice. Options trading carries
 substantial risk. Keep `ALPACA_PAPER=true` for the entire hackathon and demo
 — there's no reason to touch real money to win this competition.
+
+## VWAP bounce / break scanner (day-trade alerts)
+
+`vwap_scanner.py` is a separate tool from the options debate. It watches a
+list of tickers every minute and notifies you when one **breaks through** its
+session VWAP (a reclaim or a loss, on volume) or **bounces off** it (a
+pullback that holds and reverses). Each alert includes a reference entry,
+stop, 1R/2R targets and the next VWAP σ band.
+
+```bash
+python vwap_scanner.py --symbols SPY,QQQ,NVDA,TSLA --notify ntfy
+python vwap_scanner.py --replay tests/fixtures/spy_2026-11-02_tv.json   # see the rules on a real session
+python -m unittest discover -s tests -v
+```
+
+- **Data:** Alpaca's 1-minute bars, using the same `ALPACA_API_KEY` /
+  `ALPACA_SECRET_KEY` from `.env`. The free plan is IEX-only (`--feed iex`),
+  so the VWAP comes from IEX volume and can sit a few cents off your chart's
+  value. With a paid data plan, use `--feed sip`.
+- **Phone push:** install the free [ntfy](https://ntfy.sh) app, subscribe to
+  a hard-to-guess topic, and set `NTFY_TOPIC=<topic>` in `.env`. Telegram
+  also works: set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Check the
+  setup with `--test-notify`.
+- **Rules:** the exact rules and thresholds are documented in
+  `vwap_signals.py`. A chop filter keeps the scanner silent when price keeps
+  crossing VWAP back and forth.
+- Alerts are logged to `vwap_signals.jsonl`. They're reference levels, not
+  trade instructions.
