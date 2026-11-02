@@ -15,6 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "spy_2026-11-02_tv.json")
 
 
+def read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -186,6 +191,90 @@ class TestCalendarAndPlan(Base):
         self.assertIn("1 alert(s), 1 ticks run", s)
         self.assertIn("XYZ VWAP RECLAIM", s)
         self.assertNotIn("OLD", s)
+
+
+class TestJournal(Base):
+    def _run_spy_5min(self):
+        with open(FIXTURE) as f:
+            rows = json.load(f)["SPY"]
+        cum, hi, lo = 0.0, -1e9, 1e9
+        p = self.m.params_for(5)
+        for r in rows:
+            cum += r["v"]; hi = max(hi, r["h"]); lo = min(lo, r["l"])
+            now = datetime.fromisoformat(r["t"].replace("Z", "+00:00")) + timedelta(seconds=65)
+            if now.minute % 5 == 1:
+                self.m.cmd_tick({"data": {"AMEX:SPY": {"close": r["c"], "volume": cum, "high": hi, "low": lo}}},
+                                now, p, 5)
+        return now
+
+    def test_journal_files_and_grading(self):
+        now = self._run_spy_5min()
+        out = os.path.join(self.tmp.name, "journal")
+        md_path, csv_path = self.m.cmd_journal(now, out, ticks_expected=78)
+        md = read(md_path)
+        self.assertTrue(md_path.endswith("2026-11-02.md"))
+        self.assertIn("of 78 planned", md)
+        # Alert times match the phone push (bar close), not the bar start.
+        self.assertIn("| 10:16 | SPY | VWAP BOUNCE | long |", md)
+        self.assertIn("| 11:01 | SPY | VWAP LOSS | short |", md)
+        self.assertIn("**2R**", md)                 # the VWAP loss ran to 2R
+        self.assertIn("| SPY | 753.51 | 758.98 |", md)
+        lines = read(csv_path).splitlines()
+        self.assertEqual(lines[0].split(",")[1], "alert_time_et")
+        self.assertEqual(len(lines), 3)
+
+    def test_journal_rerun_same_day_does_not_duplicate_but_keeps_other_days(self):
+        now = self._run_spy_5min()
+        out = os.path.join(self.tmp.name, "journal")
+        os.makedirs(out)
+        with open(os.path.join(out, "alerts.csv"), "w") as f:
+            f.write("date,alert_time_et\n2026-10-30,10:00,OLD,row\n")
+        self.m.cmd_journal(now, out)
+        self.m.cmd_journal(now, out)
+        lines = read(os.path.join(out, "alerts.csv")).splitlines()
+        self.assertEqual(sum(l.startswith("2026-11-02,") for l in lines), 2)
+        self.assertIn("2026-10-30,10:00,OLD,row", lines)
+        self.assertEqual(sum(l.startswith("date,") for l in lines), 1)
+
+    def test_journal_with_no_alerts(self):
+        T = datetime(2026, 11, 3, 15, 0, 5, tzinfo=timezone.utc)
+        self.tick({"NASDAQ:XYZ": {"close": 10, "volume": 100, "high": 11, "low": 9}}, T)
+        md_path, _ = self.m.cmd_journal(T, os.path.join(self.tmp.name, "j"))
+        self.assertIn("No alerts today.", read(md_path))
+
+
+class TestGrading(unittest.TestCase):
+    def setUp(self):
+        import tv_vwap_scanner
+        from vwap_signals import Bar
+        self.m, self.Bar = tv_vwap_scanner, Bar
+        self.T = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+        self.alert = {"direction": "long", "price": 100.0, "stop": 99.0, "risk_per_share": 1.0,
+                      "targets": [101.0, 102.0], "bar_time": self.T.isoformat()}
+
+    def bars(self, hl):
+        return [self.Bar(self.T + timedelta(minutes=5 * (i + 1)), 100, h, l, (h + l) / 2, 1) for i, (h, l) in enumerate(hl)]
+
+    def test_two_r(self):
+        g = self.m.grade_alert(self.alert, self.bars([(100.5, 99.5), (101.2, 100.2), (102.1, 101.0)]))
+        self.assertEqual(g["outcome"], "2R")
+        self.assertEqual(g["mfe_r"], 2.1)
+
+    def test_stop_first(self):
+        self.assertEqual(self.m.grade_alert(self.alert, self.bars([(100.4, 98.9)]))["outcome"], "stop")
+
+    def test_one_r_then_stop(self):
+        self.assertEqual(self.m.grade_alert(self.alert, self.bars([(101.3, 100.1), (100.5, 98.5)]))["outcome"],
+                         "1R then stop")
+
+    def test_same_bar_stop_and_target_counts_as_stop(self):
+        self.assertEqual(self.m.grade_alert(self.alert, self.bars([(102.5, 98.5)]))["outcome"], "stop")
+
+    def test_short_mirror_and_close_r(self):
+        a = dict(self.alert, direction="short", stop=101.0, targets=[99.0, 98.0])
+        g = self.m.grade_alert(a, self.bars([(100.2, 99.4), (100.0, 99.2)]))
+        self.assertEqual(g["outcome"], "open")
+        self.assertEqual(g["close_r"], 0.4)
 
 
 class TestSeed(Base):

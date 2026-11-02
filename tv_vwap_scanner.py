@@ -240,6 +240,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
             k: v for k, v in state.get("seeds", {}).items() if v.get("day") == today}}
 
     state["ticks"] = state.get("ticks", 0) + 1
+    state["interval"] = interval
     alerts = 0
     for sym, snap in sorted(data.items()):
         if not isinstance(snap, dict) or snap.get("close") is None or snap.get("volume") is None:
@@ -359,6 +360,122 @@ def cmd_plan(now: datetime, interval: int) -> dict:
     return plan
 
 
+def grade_alert(alert: dict, bars: list[Bar]) -> dict:
+    """What price did after an alert, from the bars collected that day.
+    Walks forward bar by bar from the alert: whichever of stop / 1R / 2R is
+    hit first decides the outcome. If one bar spans both the stop and a
+    target, the stop is assumed first (conservative). Snapshot bars only
+    carry intra-bar extremes when they set a new day high/low, so this is an
+    approximation, good for spotting patterns across many alerts."""
+    long = alert["direction"] == "long"
+    entry, stop, risk = alert["price"], alert["stop"], alert["risk_per_share"]
+    t1, t2 = alert["targets"][0], alert["targets"][1]
+    start = datetime.fromisoformat(alert["bar_time"])
+    after = [b for b in bars if b.t > start]
+    outcome, mfe, mae = "open", 0.0, 0.0
+    hit1 = False
+    for b in after:
+        fav = (b.h - entry) if long else (entry - b.l)
+        adv = (entry - b.l) if long else (b.h - entry)
+        mfe, mae = max(mfe, fav), max(mae, adv)
+        stopped = b.l <= stop if long else b.h >= stop
+        if stopped:
+            outcome = "1R then stop" if hit1 else "stop"
+            break
+        if (b.h >= t2) if long else (b.l <= t2):
+            outcome = "2R"
+            break
+        if (b.h >= t1) if long else (b.l <= t1):
+            hit1 = True
+            outcome = "1R"
+    close_r = None
+    if after and risk > 0:
+        last = after[-1].c
+        close_r = round(((last - entry) if long else (entry - last)) / risk, 2)
+    return {"outcome": outcome, "mfe_r": round(mfe / risk, 2) if risk else None,
+            "mae_r": round(mae / risk, 2) if risk else None, "close_r": close_r}
+
+
+def cmd_journal(now: datetime, out_dir: str, ticks_expected: int | None = None) -> list[str]:
+    """Write today's review record into the repo: a Markdown page per day,
+    plus one CSV row per alert (appended) for reviewing many days at once.
+    Re-running on the same day rewrites that day's page and its CSV rows."""
+    from vwap_signals import vwap_series
+    state = load_state()
+    day = state.get("day") or now.astimezone(ET).date().isoformat()
+    bars_by_sym = {short(k): [bar_from_dict(b) for b in v["bars"]] for k, v in state.get("symbols", {}).items()}
+
+    alerts = []
+    try:
+        with open(LOG_FILE, encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                if datetime.fromisoformat(r["bar_time"]).astimezone(ET).date().isoformat() == day:
+                    alerts.append(r)
+    except OSError:
+        pass
+    for a in alerts:
+        a["grade"] = grade_alert(a, bars_by_sym.get(a["symbol"], []))
+
+    ticks = state.get("ticks", 0)
+    bar_len = timedelta(minutes=state.get("interval", 1))
+    exp = f" of {ticks_expected} planned" if ticks_expected else ""
+    md = [f"# VWAP scanner — {day}", "",
+          f"- Ticks run: **{ticks}**{exp}",
+          f"- Alerts: **{len(alerts)}**", ""]
+    counts: dict[str, int] = {}
+    for a in alerts:
+        counts[a["grade"]["outcome"]] = counts.get(a["grade"]["outcome"], 0) + 1
+    if counts:
+        md += ["Outcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())), ""]
+
+    md += ["## Alerts", ""]
+    if alerts:
+        md += ["| Alert ET | Ticker | Setup | Dir | Entry | VWAP | Stop | 1R | 2R | RelVol | Outcome | MFE R | MAE R | Close R |",
+               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for a in alerts:
+            g = a["grade"]
+            t = datetime.fromisoformat(a["bar_time"]).astimezone(ET) + bar_len
+            md.append(f"| {t:%H:%M} | {a['symbol']} | {LABEL[a['kind']]} | {a['direction']} | {a['price']:.2f} | "
+                      f"{a['vwap']:.2f} | {a['stop']:.2f} | {a['targets'][0]:.2f} | {a['targets'][1]:.2f} | "
+                      f"{a['rel_volume']:.1f}x | **{g['outcome']}** | {g['mfe_r']} | {g['mae_r']} | {g['close_r']} |")
+        md += ["", "Alert ET = when the alert fired (close of the triggering bar). MFE/MAE = best/worst move after the alert in R "
+                   "(R = entry-to-stop distance). Grading uses the scanner's snapshot bars, so treat it as approximate."]
+    else:
+        md.append("No alerts today.")
+
+    md += ["", "## End-of-day position vs VWAP", "",
+           "| Ticker | Last | VWAP | vs VWAP | Bars |", "|---|---|---|---|---|"]
+    for sym, st in sorted(state.get("symbols", {}).items()):
+        bars = bars_by_sym[short(sym)]
+        seed = tuple(st["seed"])
+        vwap = vwap_series(bars, seed)[-1][0] if bars else seed[0] / seed[1]
+        px = st["last_c"]
+        md.append(f"| {short(sym)} | {px:.2f} | {vwap:.2f} | {(px - vwap) / vwap * 100:+.2f}% | {len(bars)} |")
+
+    os.makedirs(out_dir, exist_ok=True)
+    md_path = os.path.join(out_dir, f"{day}.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md) + "\n")
+
+    csv_path = os.path.join(out_dir, "alerts.csv")
+    header = "date,alert_time_et,ticker,setup,direction,entry,vwap,stop,target_1r,target_2r,rel_volume,outcome,mfe_r,mae_r,close_r"
+    keep = []
+    if os.path.exists(csv_path):
+        with open(csv_path, encoding="utf-8") as f:
+            keep = [l.rstrip("\n") for l in f if l.strip() and not l.startswith("date,") and not l.startswith(day + ",")]
+    rows = []
+    for a in alerts:
+        g = a["grade"]
+        t = datetime.fromisoformat(a["bar_time"]).astimezone(ET) + bar_len
+        rows.append(",".join(str(x) for x in (
+            day, f"{t:%H:%M}", a["symbol"], a["kind"], a["direction"], a["price"], a["vwap"], a["stop"],
+            a["targets"][0], a["targets"][1], a["rel_volume"], g["outcome"], g["mfe_r"], g["mae_r"], g["close_r"])))
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("\n".join([header] + keep + rows) + "\n")
+    return [md_path, csv_path]
+
+
 def cmd_summary(now: datetime) -> str:
     state = load_state()
     day = state.get("day") or now.astimezone(ET).date().isoformat()
@@ -406,6 +523,9 @@ def main() -> None:
     pl.add_argument("--interval", type=int, default=5)
     pl.add_argument("--now", help="ISO timestamp override (testing)")
     sub.add_parser("summary", help="one-line end-of-day summary")
+    jr = sub.add_parser("journal", help="write today's review page + alerts.csv rows into the repo")
+    jr.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vwap_journal"))
+    jr.add_argument("--ticks-expected", type=int, default=None)
     sub.add_parser("reset")
     args = ap.parse_args()
 
@@ -416,6 +536,8 @@ def main() -> None:
         print(cmd_seed(args.symbol, json.load(sys.stdin), now))
     elif args.cmd == "plan":
         print(json.dumps(cmd_plan(now, args.interval), indent=2))
+    elif args.cmd == "journal":
+        print("\n".join(cmd_journal(now, args.out, args.ticks_expected)))
     elif args.cmd == "summary":
         print(cmd_summary(now))
     elif args.cmd == "status":

@@ -583,3 +583,12 @@ each snapshot becomes one 5-minute bar, one 5-minute close beyond the zone
 confirms a break, and the volume bar is 1.25x, the 1-minute 1.5x adjusted
 for 5-bar averaging. A 5-minute replay of 2026-11-02 SPY fires the 10:16
 VWAP bounce and the 11:01 VWAP loss, and nothing else.
+
+**End-of-day journal.** `python3 tv_vwap_scanner.py journal` writes
+`vwap_journal/<date>.md` with the day's alerts, ticks run, and each ticker's
+close against VWAP. It also adds one row per alert to `vwap_journal/alerts.csv`,
+for reviewing many days at once. Each alert is graded from that day's bars
+as **2R**, **1R**, **1R then stop**, **stop** or **open**, along with its
+maximum favourable and adverse excursion (MFE/MAE) and its result at the
+close, all in R. The scheduled session commits these files to this branch
+after the close.
