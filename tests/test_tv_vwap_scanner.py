@@ -50,6 +50,41 @@ class TestSnapshotReplay(Base):
         self.assertIn("VWAP    758.98", status)
 
 
+class TestFiveMinuteMode(Base):
+    def test_spy_session_at_5min_ticks(self):
+        """Same session sampled every 5 minutes (as the scheduled task runs):
+        catches the morning bounce and the VWAP loss, and nothing else."""
+        with open(FIXTURE) as f:
+            rows = json.load(f)["SPY"]
+        cum, hi, lo, alerts = 0.0, -1e9, 1e9, []
+        p = self.m.params_for(5)
+        for r in rows:
+            cum += r["v"]; hi = max(hi, r["h"]); lo = min(lo, r["l"])
+            now = datetime.fromisoformat(r["t"].replace("Z", "+00:00")) + timedelta(seconds=65)
+            if now.minute % 5 != 1:
+                continue
+            out = self.m.cmd_tick({"data": {"AMEX:SPY": {"close": r["c"], "volume": cum, "high": hi, "low": lo}}},
+                                  now, p, 5)
+            alerts += [l for l in out if l.startswith("ALERT")]
+        self.assertEqual(len(alerts), 2, alerts)
+        self.assertIn("VWAP BOUNCE", alerts[0]); self.assertIn("10:16 ET", alerts[0])
+        self.assertIn("VWAP LOSS", alerts[1]); self.assertIn("11:01 ET", alerts[1])
+
+    def test_5min_ticks_make_one_bar_each(self):
+        T = datetime(2026, 11, 3, 15, 0, 5, tzinfo=timezone.utc)
+        p = self.m.params_for(5)
+        snap = lambda c, v: {"data": {"NASDAQ:XYZ": {"close": c, "volume": v, "high": 200, "low": 1}}}
+        self.m.cmd_tick(snap(100, 1000), T, p, 5)
+        self.m.cmd_tick(snap(101, 2000), T + timedelta(minutes=5), p, 5)
+        self.m.cmd_tick(snap(103, 4000), T + timedelta(minutes=15), p, 5)   # one tick missed
+        bars = self.m.load_state()["symbols"]["NASDAQ:XYZ"]["bars"]
+        self.assertEqual([round(b["v"]) for b in bars], [1000, 1000, 1000])
+
+    def test_unsupported_interval_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.m.params_for(3)
+
+
 class TestTickMechanics(Base):
     T = datetime(2026, 11, 3, 15, 0, 5, tzinfo=timezone.utc)   # 10:00:05 ET, a Tuesday
 

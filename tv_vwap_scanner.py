@@ -54,7 +54,32 @@ STATE_DIR = os.getenv("VWAP_STATE_DIR") or os.path.join(os.path.dirname(os.path.
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "signals.jsonl")
 COOLDOWN = timedelta(minutes=15)
-MAX_SPLIT = 10          # a gap longer than this many minutes is one bar, not ten
+MAX_SPLIT = 10          # a gap longer than this many intervals is one bar, not ten
+
+
+def params_for(interval_min: int) -> Params:
+    """Rule set per tick interval. The 1-minute defaults live in Params; at
+    5 minutes each bar carries 5x the information, so lookbacks shrink and a
+    single 5-minute close beyond the zone is enough to confirm a break."""
+    if interval_min == 1:
+        return Params()
+    if interval_min == 5:
+        return Params(
+            min_session_bars=3,      # 15 min after the open
+            atr_len=6,               # 30 min
+            side_lookback=3,         # 15 min on the old side
+            confirm_bars=1,          # one 5-min close beyond the zone
+            vol_lookback=12,         # vs. the last hour
+            # Averaging over 5 bars shrinks volume spikes ~sqrt(5)x, so the
+            # 1-min rule's 1.5x (= +0.5 above normal) becomes 1 + 0.5/sqrt(5).
+            break_rel_vol=1.25,
+            trend_lookback=4,        # 20 min of trend before the pullback
+            trend_min_frac=0.75,
+            touch_window=2,          # pullback within the last 10 min
+            chop_lookback=12,        # crosses in the last hour
+            chop_max_crosses=3,
+        )
+    raise SystemExit(f"unsupported --interval {interval_min}; use 1 or 5")
 MAX_BARS = 420          # > one full session of minute bars
 
 LABEL = {
@@ -136,8 +161,8 @@ def init_symbol(snap: dict, now: datetime, pending_seed: dict | None) -> dict:
     }
 
 
-def snapshot_to_bars(st: dict, snap: dict, now: datetime) -> list[Bar]:
-    """New 1-minute bars covering the time since the previous snapshot."""
+def snapshot_to_bars(st: dict, snap: dict, now: datetime, interval: int = 1) -> list[Bar]:
+    """New `interval`-minute bars covering the time since the previous snapshot."""
     c, V = float(snap["close"]), float(snap["volume"])
     hi, lo = float(snap["high"]), float(snap["low"])
     dv = V - st["last_v"]
@@ -145,7 +170,7 @@ def snapshot_to_bars(st: dict, snap: dict, now: datetime) -> list[Bar]:
         return []                        # no trades (or a stale/duplicate quote)
     prev_t = datetime.fromisoformat(st["last_t"])
     secs = max((now - prev_t).total_seconds(), 1.0)
-    k = max(1, min(MAX_SPLIT, round(secs / 60)))
+    k = max(1, min(MAX_SPLIT, round(secs / (60 * interval))))
     o0 = st["last_c"]
     bars = []
     for i in range(k):
@@ -157,7 +182,7 @@ def snapshot_to_bars(st: dict, snap: dict, now: datetime) -> list[Bar]:
                 h = max(h, hi)
             if lo < st["last_l"]:
                 l = min(l, lo)
-        t = prev_t + timedelta(seconds=secs * (i + 1) / k) - timedelta(minutes=1)
+        t = prev_t + timedelta(seconds=secs * (i + 1) / k) - timedelta(minutes=interval)
         bars.append(Bar(t=t, o=o, h=h, l=l, c=cl, v=dv / k))
     st.update(last_t=now.isoformat(), last_c=c, last_v=V, last_h=hi, last_l=lo)
     return bars
@@ -167,15 +192,15 @@ def snapshot_to_bars(st: dict, snap: dict, now: datetime) -> list[Bar]:
 # Commands
 # ---------------------------------------------------------------------------
 
-def format_alert(sym: str, s: Signal) -> str:
-    t = datetime.fromisoformat(s.bar_time).astimezone(ET) + timedelta(minutes=1)
+def format_alert(sym: str, s: Signal, interval: int = 1) -> str:
+    t = datetime.fromisoformat(s.bar_time).astimezone(ET) + timedelta(minutes=interval)
     arrow = "▲" if s.direction == "long" else "▼"
     return (f"{arrow} {short(sym)} {LABEL[s.kind]} {s.price:.2f} ({s.direction}) | "
             f"VWAP {s.vwap:.2f} | stop {s.stop:.2f} | 1R {s.targets[0]:.2f} 2R {s.targets[1]:.2f} | "
             f"relvol {s.rel_volume:.1f}x | {t:%H:%M} ET")
 
 
-def cmd_tick(payload: dict, now: datetime, params: Params) -> list[str]:
+def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) -> list[str]:
     data = payload.get("data", payload)
     now_et = now.astimezone(ET)
     lines: list[str] = []
@@ -198,7 +223,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params) -> list[str]:
             st = init_symbol(snap, now, state["seeds"].get(short(sym)))
             state["symbols"][sym] = st
             continue
-        new = snapshot_to_bars(st, snap, now)
+        new = snapshot_to_bars(st, snap, now, interval)
         if not new:
             continue
         bars = [bar_from_dict(b) for b in st["bars"]]
@@ -210,7 +235,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params) -> list[str]:
                 if last and b.t - datetime.fromisoformat(last) < COOLDOWN:
                     continue
                 st["fired"][s.kind] = b.t.isoformat()
-                lines.append("ALERT " + format_alert(sym, s))
+                lines.append("ALERT " + format_alert(sym, s, interval))
                 alerts += 1
                 _log(sym, s)
         if len(bars) > MAX_BARS:         # fold the oldest bars into the seed
@@ -223,7 +248,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params) -> list[str]:
 
     save_state(state)
     n_bars = min((len(s["bars"]) for s in state["symbols"].values()), default=0)
-    warm = "" if n_bars >= params.min_session_bars + 5 else f" · warming up ({n_bars} bars)"
+    warm = "" if n_bars >= params.min_session_bars + 2 else f" · warming up ({n_bars} bars)"
     lines.append(f"STATUS {now_et:%H:%M} ET · {len(data)} tickers · {alerts} alert(s){warm}")
     return lines
 
@@ -290,6 +315,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("tick", help="feed one get_symbol_data_batch JSON on stdin")
     t.add_argument("--now", help="ISO timestamp override (testing)")
+    t.add_argument("--interval", type=int, default=1, help="minutes between ticks: 1 or 5 (default 1)")
     s = sub.add_parser("seed", help="seed one ticker's VWAP from today's OHLCV JSON on stdin")
     s.add_argument("symbol")
     s.add_argument("--now", help="ISO timestamp override (testing)")
@@ -299,7 +325,7 @@ def main() -> None:
 
     now = datetime.fromisoformat(args.now) if getattr(args, "now", None) else datetime.now(timezone.utc)
     if args.cmd == "tick":
-        print("\n".join(cmd_tick(json.load(sys.stdin), now, Params())))
+        print("\n".join(cmd_tick(json.load(sys.stdin), now, params_for(args.interval), args.interval)))
     elif args.cmd == "seed":
         print(cmd_seed(args.symbol, json.load(sys.stdin), now))
     elif args.cmd == "status":

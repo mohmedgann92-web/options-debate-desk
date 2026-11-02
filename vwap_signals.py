@@ -177,9 +177,9 @@ def detect(symbol: str, bars: list[Bar], p: Params | None = None,
     pass the whole session so far so VWAP is correct."""
     p = p or Params()
     n = len(bars)
-    need = max(p.min_session_bars, p.side_lookback + p.confirm_bars,
-               p.trend_lookback + p.touch_window + 1)
-    if n < need:
+    # Breaks can fire as soon as there's enough history for a cross; bounces
+    # need a longer trend window and check their own minimum below.
+    if n < max(p.min_session_bars, p.side_lookback + p.confirm_bars):
         return []
 
     vw = vwap_series(bars, seed)
@@ -256,6 +256,8 @@ def _check_break(symbol, bars, vw, buf, avg_vol, p: Params, direction) -> Signal
 
 def _check_bounce(symbol, bars, vw, buf, avg_vol, p: Params, direction) -> Signal | None:
     n = len(bars)
+    if n < p.trend_lookback + p.touch_window + 1:
+        return None
     trig = n - 1
     touch = range(n - 1 - p.touch_window, n - 1)
     trend = range(n - 1 - p.touch_window - p.trend_lookback, n - 1 - p.touch_window)

@@ -577,3 +577,9 @@ the VWAP loss fired at 10:59 ET and the session VWAP matched 758.98 exactly.
 If you start the scanner mid-session, seed each ticker first with today's
 5-minute bars (`tv_vwap_scanner.py seed SPY < bars.json`). State is kept in
 `.vwap_state/`.
+
+Ticking every 5 minutes (`tick --interval 5`) uses a rescaled rule set:
+each snapshot becomes one 5-minute bar, one 5-minute close beyond the zone
+confirms a break, and the volume bar is 1.25x, the 1-minute 1.5x adjusted
+for 5-bar averaging. A 5-minute replay of 2026-11-02 SPY fires the 10:16
+VWAP bounce and the 11:01 VWAP loss, and nothing else.
