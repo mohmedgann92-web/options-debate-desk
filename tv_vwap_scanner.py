@@ -322,6 +322,71 @@ def cmd_seed(symbol: str, payload: dict, now: datetime) -> str:
     return f"SEEDED {symbol.upper()} from {used} bars: VWAP {vwap:.2f} σ {sd:.2f}"
 
 
+def tick_times_et(now: datetime, interval: int) -> list[datetime]:
+    """All of today's tick times (ET): 1 min after the open, then every
+    `interval` minutes, last one before the close."""
+    open_et, close_et = session_bounds(now.astimezone(ET))
+    times, t = [], open_et + timedelta(minutes=1)
+    while t < close_et:
+        times.append(t)
+        t += timedelta(minutes=interval)
+    return times
+
+
+CLAIM_FILE = os.path.join(STATE_DIR, "claim.json")
+
+
+def cmd_claim(now: datetime, interval: int) -> str:
+    """Called at the START of every tick. Durable one-shot reminders drive
+    the tick chain (in-session cron jobs do not survive the container being
+    recycled). Each tick claims its slot here, then schedules the next tick.
+
+    Prints one of:
+      CLOSED                 not a trading session right now - do nothing
+      DUPLICATE <age>s       another tick ran moments ago - skip entirely
+                             (stops a restarted chain from doubling up)
+      NEXT <utc iso>         run this tick, schedule the next at that time
+      END <utc iso>          run this tick, it is the last; schedule the
+                             end-of-day step at that time instead
+    """
+    now_et = now.astimezone(ET)
+    ok, _ = is_trading_day(now_et)
+    open_et, close_et = session_bounds(now_et)
+    if not ok or not (open_et <= now_et < close_et + timedelta(minutes=1)):
+        return "CLOSED"
+    try:
+        with open(CLAIM_FILE, encoding="utf-8") as f:
+            last = datetime.fromisoformat(json.load(f)["t"])
+    except (OSError, ValueError, KeyError):
+        last = None
+    if last and timedelta(0) <= now - last < timedelta(seconds=interval * 60 * 0.5):
+        return f"DUPLICATE {int((now - last).total_seconds())}s"
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(CLAIM_FILE, "w", encoding="utf-8") as f:
+        json.dump({"t": now.isoformat()}, f)
+    upcoming = [t for t in tick_times_et(now, interval) if t > now_et + timedelta(seconds=60)]
+    fmt = lambda t: t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if upcoming:
+        return f"NEXT {fmt(upcoming[0])}"
+    return f"END {fmt(close_et + timedelta(minutes=5))}"
+
+
+def cmd_health(now: datetime, interval: int) -> str:
+    """For the hourly watchdog: is the tick chain alive?"""
+    now_et = now.astimezone(ET)
+    ok, _ = is_trading_day(now_et)
+    open_et, close_et = session_bounds(now_et)
+    if not ok or not (open_et <= now_et < close_et):
+        return "CLOSED"
+    try:
+        with open(CLAIM_FILE, encoding="utf-8") as f:
+            last = datetime.fromisoformat(json.load(f)["t"])
+    except (OSError, ValueError, KeyError):
+        return "STALE never"
+    age = (now - last).total_seconds() / 60
+    return f"STALE {age:.0f}m" if age > interval * 2 + 2 else f"OK {age:.0f}m"
+
+
 def cmd_plan(now: datetime, interval: int) -> dict:
     """Today's tick times as cron expressions in THIS MACHINE'S local time
     (what CronCreate uses), pinned to today's date so a job can never fire
@@ -357,6 +422,7 @@ def cmd_plan(now: datetime, interval: int) -> dict:
     plan["end_cron"] = f"{end.minute} {end.hour} {end.day} {end.month} *"
     plan["session_et"] = f"{open_et:%H:%M}-{close_et:%H:%M}"
     plan["ticks_expected"] = len(times)
+    plan["first_tick_utc"] = (open_et + timedelta(minutes=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return plan
 
 
@@ -527,6 +593,11 @@ def main() -> None:
     jr.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vwap_journal"))
     jr.add_argument("--ticks-expected", type=int, default=None)
     sub.add_parser("reset")
+    for name, helptext in (("claim", "start of every tick: claim the slot, print NEXT/END/DUPLICATE/CLOSED"),
+                           ("health", "watchdog: is the tick chain alive?")):
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("--interval", type=int, default=5)
+        sp.add_argument("--now", help="ISO timestamp override (testing)")
     args = ap.parse_args()
 
     now = datetime.fromisoformat(args.now) if getattr(args, "now", None) else datetime.now(timezone.utc)
@@ -534,6 +605,10 @@ def main() -> None:
         print("\n".join(cmd_tick(json.load(sys.stdin), now, params_for(args.interval), args.interval)))
     elif args.cmd == "seed":
         print(cmd_seed(args.symbol, json.load(sys.stdin), now))
+    elif args.cmd == "claim":
+        print(cmd_claim(now, args.interval))
+    elif args.cmd == "health":
+        print(cmd_health(now, args.interval))
     elif args.cmd == "plan":
         print(json.dumps(cmd_plan(now, args.interval), indent=2))
     elif args.cmd == "journal":
@@ -543,8 +618,9 @@ def main() -> None:
     elif args.cmd == "status":
         print("\n".join(cmd_status(now)))
     elif args.cmd == "reset":
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
+        for f in (STATE_FILE, CLAIM_FILE):
+            if os.path.exists(f):
+                os.remove(f)
         print("state cleared")
 
 

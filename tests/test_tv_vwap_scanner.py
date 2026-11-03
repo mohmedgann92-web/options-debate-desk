@@ -193,6 +193,53 @@ class TestCalendarAndPlan(Base):
         self.assertNotIn("OLD", s)
 
 
+class TestTickChain(Base):
+    """claim/health drive the durable reminder chain that replaced in-session
+    cron jobs (those vanished whenever the cloud container was recycled)."""
+
+    def at(self, hhmmss, day="2026-11-03"):        # times in ET (EST = UTC-5)
+        h, m, s = map(int, hhmmss.split(":"))
+        return datetime.fromisoformat(f"{day}T{h + 5:02d}:{m:02d}:{s:02d}+00:00")
+
+    def test_first_tick_schedules_next_slot(self):
+        self.assertEqual(self.m.cmd_claim(self.at("09:31:20"), 5), "NEXT 2026-11-03T14:36:00Z")
+
+    def test_late_tick_skips_to_following_slot(self):
+        # Woken 40s before a slot: too close, schedule the one after.
+        self.assertEqual(self.m.cmd_claim(self.at("09:35:20"), 5), "NEXT 2026-11-03T14:41:00Z")
+
+    def test_duplicate_guard(self):
+        self.m.cmd_claim(self.at("10:01:05"), 5)
+        self.assertTrue(self.m.cmd_claim(self.at("10:02:00"), 5).startswith("DUPLICATE"))
+        self.assertTrue(self.m.cmd_claim(self.at("10:06:05"), 5).startswith("NEXT"))
+
+    def test_last_tick_schedules_end(self):
+        self.assertEqual(self.m.cmd_claim(self.at("15:56:10"), 5), "END 2026-11-03T21:05:00Z")
+
+    def test_early_close_ends_at_1pm(self):
+        out = self.m.cmd_claim(self.at("12:56:10", day="2026-11-27"), 5)
+        self.assertEqual(out, "END 2026-11-27T18:05:00Z")
+
+    def test_closed_outside_session_and_holidays(self):
+        self.assertEqual(self.m.cmd_claim(self.at("09:10:00"), 5), "CLOSED")
+        self.assertEqual(self.m.cmd_claim(self.at("10:00:00", day="2026-11-26"), 5), "CLOSED")
+
+    def test_health(self):
+        self.assertEqual(self.m.cmd_health(self.at("10:00:00"), 5), "STALE never")
+        self.m.cmd_claim(self.at("10:01:05"), 5)
+        self.assertTrue(self.m.cmd_health(self.at("10:05:00"), 5).startswith("OK"))
+        self.assertTrue(self.m.cmd_health(self.at("10:20:00"), 5).startswith("STALE"))
+        self.assertEqual(self.m.cmd_health(self.at("17:00:00"), 5), "CLOSED")
+
+    def test_prompt_files_exist_and_reference_each_other(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tick = read(os.path.join(root, "scanner_prompts", "tick.md"))
+        self.assertIn("scanner_prompts/tick.md", tick)
+        self.assertIn("scanner_prompts/end.md", tick)
+        self.assertIn("claim --interval 5", tick)
+        self.assertIn("health --interval 5", read(os.path.join(root, "scanner_prompts", "watchdog.md")))
+
+
 class TestJournal(Base):
     def _run_spy_5min(self):
         with open(FIXTURE) as f:
