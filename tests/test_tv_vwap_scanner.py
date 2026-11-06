@@ -290,6 +290,62 @@ class TestJournal(Base):
         self.assertIn("No alerts today.", read(md_path))
 
 
+class TestIndexFilter(Base):
+    """Longs only with SPY and QQQ above VWAP, shorts only with both below."""
+
+    def sig(self, direction):
+        from vwap_signals import Signal
+        return Signal(symbol="X", kind="break_up" if direction == "long" else "break_down",
+                      direction=direction, bar_time="2026-11-05T15:00:00+00:00", price=10, vwap=10,
+                      sd=0.1, distance_pct=0, rel_volume=2, buffer=0.1, stop=9, risk_per_share=1,
+                      targets=[11, 12])
+
+    def test_rules(self):
+        up, down, mixed = {"SPY": 1, "QQQ": 1}, {"SPY": -1, "QQQ": -1}, {"SPY": 1, "QQQ": -1}
+        allows = lambda sym, d, side: self.m.index_allows(sym, self.sig(d), side)[0]
+        self.assertTrue(allows("NASDAQ:INTC", "long", up))
+        self.assertFalse(allows("NASDAQ:INTC", "long", down))
+        self.assertTrue(allows("NASDAQ:INTC", "short", down))
+        self.assertFalse(allows("NASDAQ:INTC", "short", up))
+        self.assertFalse(allows("NASDAQ:INTC", "long", mixed))
+        self.assertFalse(allows("NASDAQ:INTC", "short", mixed))
+        # SQQQ is inverse: a SQQQ long is a market short.
+        self.assertTrue(allows("NASDAQ:SQQQ", "long", down))
+        self.assertFalse(allows("NASDAQ:SQQQ", "long", up))
+        # Filter stays off until both indexes have data.
+        self.assertTrue(allows("NASDAQ:INTC", "long", {"SPY": -1}))
+        why = self.m.index_allows("NASDAQ:INTC", self.sig("long"), down)[1]
+        self.assertEqual(why, "SPY below, QQQ below VWAP")
+
+    def test_tick_blocks_and_journal_lists_it(self):
+        # Replay the SPY fixture as INTC alongside a SPY/QQQ that sit flat
+        # BELOW their VWAP: INTC's long bounce must be blocked, its short kept.
+        with open(FIXTURE) as f:
+            rows = json.load(f)["SPY"]
+        cum, hi, lo = 0.0, -1e9, 1e9
+        p = self.m.params_for(5)
+        out, k = [], 0
+        for r in rows:
+            cum += r["v"]; hi = max(hi, r["h"]); lo = min(lo, r["l"])
+            now = datetime.fromisoformat(r["t"].replace("Z", "+00:00")) + timedelta(seconds=65)
+            if now.minute % 5 == 1:
+                k += 1
+                idx = 100 if k == 1 else 99          # opens at 100 then sits below VWAP
+                snap = {"NASDAQ:INTC": {"close": r["c"], "volume": cum, "high": hi, "low": lo},
+                        "AMEX:SPY": {"close": idx, "volume": 1000 * k, "high": 100, "low": 99},
+                        "NASDAQ:QQQ": {"close": idx, "volume": 1000 * k, "high": 100, "low": 99}}
+                out += self.m.cmd_tick({"data": snap}, now, p, 5)
+        text = "\n".join(out)
+        self.assertIn("BLOCKED INTC VWAP BOUNCE (long): SPY below, QQQ below VWAP", text)
+        self.assertIn("ALERT ▼ INTC VWAP LOSS", text)
+        self.assertNotIn("ALERT ▲ INTC", text)
+        md_path, csv_path = self.m.cmd_journal(now, os.path.join(self.tmp.name, "j"))
+        md = read(md_path)
+        self.assertIn("## Blocked by index filter", md)
+        self.assertIn("| 10:16 | INTC | VWAP BOUNCE | long |", md)
+        self.assertEqual(sum(l.startswith("2026-11-02,") for l in read(csv_path).splitlines()), 1)
+
+
 class TestGrading(unittest.TestCase):
     def setUp(self):
         import tv_vwap_scanner

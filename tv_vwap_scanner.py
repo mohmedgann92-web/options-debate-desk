@@ -53,6 +53,11 @@ ET = ZoneInfo("America/New_York")
 STATE_DIR = os.getenv("VWAP_STATE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vwap_state")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "signals.jsonl")
+BLOCKED_FILE = os.path.join(STATE_DIR, "blocked.jsonl")
+# Index filter: longs only while SPY and QQQ are both above their VWAP, shorts
+# only while both are below; mixed = no alerts. Inverse ETFs flip direction.
+INDEX_SYMBOLS = ("SPY", "QQQ")
+INVERSE = {"SQQQ"}
 COOLDOWN = timedelta(minutes=15)
 MAX_SPLIT = 10          # a gap longer than this many intervals is one bar, not ten
 
@@ -242,6 +247,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
     state["ticks"] = state.get("ticks", 0) + 1
     state["interval"] = interval
     alerts = 0
+    candidates: list[tuple[str, dict, datetime, Signal]] = []
     for sym, snap in sorted(data.items()):
         if not isinstance(snap, dict) or snap.get("close") is None or snap.get("volume") is None:
             lines.append(f"WARN {short(sym)}: incomplete quote, skipped")
@@ -262,10 +268,7 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
                 last = st["fired"].get(s.kind)
                 if last and b.t - datetime.fromisoformat(last) < COOLDOWN:
                     continue
-                st["fired"][s.kind] = b.t.isoformat()
-                lines.append("ALERT " + format_alert(sym, s, interval))
-                alerts += 1
-                _log(sym, s)
+                candidates.append((sym, st, b.t, s))
         if len(bars) > MAX_BARS:         # fold the oldest bars into the seed
             for old in bars[:-MAX_BARS]:
                 p = old.price
@@ -274,17 +277,67 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
             st["seed"] = list(seed)
         st["bars"] = [bar_to_dict(b) for b in bars]
 
+    side = market_side(state)
+    blocked = 0
+    for sym, st, bar_t, s in candidates:
+        ok, why = index_allows(sym, s, side)
+        if not ok:
+            blocked += 1
+            lines.append(f"BLOCKED {short(sym)} {LABEL[s.kind]} ({s.direction}): {why}")
+            _log(sym, s, BLOCKED_FILE, why)
+            continue
+        st["fired"][s.kind] = bar_t.isoformat()
+        lines.append("ALERT " + format_alert(sym, s, interval))
+        alerts += 1
+        _log(sym, s)
+
     save_state(state)
     n_bars = min((len(s["bars"]) for s in state["symbols"].values()), default=0)
     warm = "" if n_bars >= params.min_session_bars + 2 else f" · warming up ({n_bars} bars)"
-    lines.append(f"STATUS {now_et:%H:%M} ET · {len(data)} tickers · {alerts} alert(s){warm}")
+    blk = f" · {blocked} blocked by index filter" if blocked else ""
+    lines.append(f"STATUS {now_et:%H:%M} ET · {len(data)} tickers · {alerts} alert(s){blk}{warm}")
     return lines
 
 
-def _log(sym: str, s: Signal) -> None:
+def _log(sym: str, s: Signal, path: str | None = None, why: str | None = None) -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"symbol_full": sym, **s.to_dict()}) + "\n")
+    rec = {"symbol_full": sym, **s.to_dict()}
+    if why:
+        rec["blocked_reason"] = why
+    with open(path or LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def market_side(state: dict) -> dict:
+    """Each index ETF's last price vs its session VWAP: {"SPY": +1|-1, ...}.
+    An index with no data yet is left out."""
+    from vwap_signals import vwap_series
+    out = {}
+    for sym, st in state.get("symbols", {}).items():
+        if short(sym) not in INDEX_SYMBOLS:
+            continue
+        bars = [bar_from_dict(b) for b in st["bars"]]
+        seed = tuple(st["seed"])
+        if not bars and not seed[1]:
+            continue                      # no volume yet: unknown side
+        vwap = vwap_series(bars, seed)[-1][0] if bars else seed[0] / seed[1]
+        out[short(sym)] = 1 if st["last_c"] > vwap else -1
+    return out
+
+
+def index_allows(sym: str, s: Signal, side: dict) -> tuple[bool, str]:
+    """Longs need SPY and QQQ above VWAP, shorts need both below. Inverse
+    ETFs (SQQQ) are judged by the market direction they bet on. If either
+    index has no data yet the filter stays off."""
+    if any(i not in side for i in INDEX_SYMBOLS):
+        return True, "index data missing"
+    want = 1 if s.direction == "long" else -1
+    if short(sym) in INVERSE:
+        want = -want
+    if all(side[i] == want for i in INDEX_SYMBOLS):
+        return True, ""
+    desc = ", ".join(f"{i} {'above' if side[i] > 0 else 'below'}" for i in INDEX_SYMBOLS)
+    return False, f"{desc} VWAP"
 
 
 def cmd_seed(symbol: str, payload: dict, now: datetime) -> str:
@@ -509,6 +562,26 @@ def cmd_journal(now: datetime, out_dir: str, ticks_expected: int | None = None) 
                    "(R = entry-to-stop distance). Grading uses the scanner's snapshot bars, so treat it as approximate."]
     else:
         md.append("No alerts today.")
+
+    blocked = []
+    try:
+        with open(BLOCKED_FILE, encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                if datetime.fromisoformat(r["bar_time"]).astimezone(ET).date().isoformat() == day:
+                    blocked.append(r)
+    except OSError:
+        pass
+    if blocked:
+        md += ["", "## Blocked by index filter (not pushed)", "",
+               "Graded the same way, to check whether the SPY/QQQ filter is helping.", "",
+               "| Alert ET | Ticker | Setup | Dir | Entry | Why blocked | Outcome | MFE R | MAE R |",
+               "|---|---|---|---|---|---|---|---|---|"]
+        for a in blocked:
+            g = grade_alert(a, bars_by_sym.get(a["symbol"], []))
+            t = datetime.fromisoformat(a["bar_time"]).astimezone(ET) + bar_len
+            md.append(f"| {t:%H:%M} | {a['symbol']} | {LABEL[a['kind']]} | {a['direction']} | {a['price']:.2f} | "
+                      f"{a['blocked_reason']} | {g['outcome']} | {g['mfe_r']} | {g['mae_r']} |")
 
     md += ["", "## End-of-day position vs VWAP", "",
            "| Ticker | Last | VWAP | vs VWAP | Bars |", "|---|---|---|---|---|"]
