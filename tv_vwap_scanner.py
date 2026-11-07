@@ -701,7 +701,10 @@ def main() -> None:
     jr.add_argument("--block", action="store_true", help="print the whole journal as one text block")
     eo = sub.add_parser("eod", help="end of day in one call: summary + journal files + full block")
     eo.add_argument("--interval", type=int, default=5)
-    eo.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vwap_journal"))
+    # Default to the git-ignored state folder: the scanner session must leave the
+    # repo clean (its stop hook nags about uncommitted files). The saver session
+    # commits the journal from the printed block.
+    eo.add_argument("--out", default=os.path.join(STATE_DIR, "journal"))
     eo.add_argument("--now", help="ISO timestamp override (testing)")
     sub.add_parser("reset")
     for name, helptext in (("claim", "start of every tick: claim the slot, print NEXT/END/DUPLICATE/CLOSED"),
