@@ -615,6 +615,38 @@ def cmd_journal(now: datetime, out_dir: str, ticks_expected: int | None = None) 
     return [md_path, csv_path]
 
 
+def cmd_tick_claimed(payload: dict, now: datetime, params: Params, interval: int) -> list[str]:
+    """tick with the slot claim built in: one script call instead of two.
+    CLOSED / DUPLICATE come back as a single line and nothing is processed."""
+    res = cmd_claim(now, interval)
+    if res.startswith(("CLOSED", "DUPLICATE")):
+        return [res]
+    return cmd_tick(payload, now, params, interval)
+
+
+def cmd_block(now: datetime, out_dir: str, ticks_expected: int | None = None) -> str:
+    """Write the journal files, then return the whole record as one text block
+    (journal page + today's CSV rows) so a reader never has to retype it."""
+    md_path, csv_path = cmd_journal(now, out_dir, ticks_expected)
+    day = os.path.basename(md_path)[:-3]
+    with open(md_path, encoding="utf-8") as f:
+        md = f.read().rstrip("\n")
+    with open(csv_path, encoding="utf-8") as f:
+        rows = [l.rstrip("\n") for l in f if l.startswith(day + ",")]
+    return "\n".join([f"=== VWAP JOURNAL {day} PUSHED=no ===", md, "=== VWAP CSV ROWS ===", *rows,
+                      "=== VWAP END ==="])
+
+
+def cmd_eod(now: datetime, interval: int, out_dir: str) -> str:
+    """End of day in one call: NO_SESSION, or `PUSH <summary line>` followed
+    by the full journal block."""
+    plan = cmd_plan(now, interval)
+    if not plan["trading_day"]:
+        return f"NO_SESSION {plan['reason']}"
+    summary = cmd_summary(now)
+    return f"PUSH {summary}\n" + cmd_block(now, out_dir, plan["ticks_expected"])
+
+
 def cmd_summary(now: datetime) -> str:
     state = load_state()
     day = state.get("day") or now.astimezone(ET).date().isoformat()
@@ -654,6 +686,7 @@ def main() -> None:
     t = sub.add_parser("tick", help="feed one get_symbol_data_batch JSON on stdin")
     t.add_argument("--now", help="ISO timestamp override (testing)")
     t.add_argument("--interval", type=int, default=1, help="minutes between ticks: 1 or 5 (default 1)")
+    t.add_argument("--claim", action="store_true", help="also claim the slot first; prints CLOSED/DUPLICATE and stops")
     s = sub.add_parser("seed", help="seed one ticker's VWAP from today's OHLCV JSON on stdin")
     s.add_argument("symbol")
     s.add_argument("--now", help="ISO timestamp override (testing)")
@@ -665,6 +698,11 @@ def main() -> None:
     jr = sub.add_parser("journal", help="write today's review page + alerts.csv rows into the repo")
     jr.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vwap_journal"))
     jr.add_argument("--ticks-expected", type=int, default=None)
+    jr.add_argument("--block", action="store_true", help="print the whole journal as one text block")
+    eo = sub.add_parser("eod", help="end of day in one call: summary + journal files + full block")
+    eo.add_argument("--interval", type=int, default=5)
+    eo.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vwap_journal"))
+    eo.add_argument("--now", help="ISO timestamp override (testing)")
     sub.add_parser("reset")
     for name, helptext in (("claim", "start of every tick: claim the slot, print NEXT/END/DUPLICATE/CLOSED"),
                            ("health", "watchdog: is the tick chain alive?")):
@@ -675,7 +713,8 @@ def main() -> None:
 
     now = datetime.fromisoformat(args.now) if getattr(args, "now", None) else datetime.now(timezone.utc)
     if args.cmd == "tick":
-        print("\n".join(cmd_tick(json.load(sys.stdin), now, params_for(args.interval), args.interval)))
+        run = cmd_tick_claimed if args.claim else cmd_tick
+        print("\n".join(run(json.load(sys.stdin), now, params_for(args.interval), args.interval)))
     elif args.cmd == "seed":
         print(cmd_seed(args.symbol, json.load(sys.stdin), now))
     elif args.cmd == "claim":
@@ -685,7 +724,12 @@ def main() -> None:
     elif args.cmd == "plan":
         print(json.dumps(cmd_plan(now, args.interval), indent=2))
     elif args.cmd == "journal":
-        print("\n".join(cmd_journal(now, args.out, args.ticks_expected)))
+        if args.block:
+            print(cmd_block(now, args.out, args.ticks_expected))
+        else:
+            print("\n".join(cmd_journal(now, args.out, args.ticks_expected)))
+    elif args.cmd == "eod":
+        print(cmd_eod(now, args.interval, args.out))
     elif args.cmd == "summary":
         print(cmd_summary(now))
     elif args.cmd == "status":

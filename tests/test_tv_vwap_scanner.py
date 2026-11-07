@@ -346,6 +346,48 @@ class TestIndexFilter(Base):
         self.assertEqual(sum(l.startswith("2026-11-02,") for l in read(csv_path).splitlines()), 1)
 
 
+class TestOneCallHelpers(Base):
+    def at(self, hhmm, day="2026-11-03"):
+        h, m = map(int, hhmm.split(":"))
+        return datetime.fromisoformat(f"{day}T{h:02d}:{m:02d}:10-05:00")
+
+    def spy(self):
+        return {"AMEX:SPY": {"close": 100, "volume": 1000, "high": 101, "low": 99}}
+
+    def test_tick_claimed_skips_when_closed_or_duplicate(self):
+        p = self.m.params_for(5)
+        self.assertEqual(self.m.cmd_tick_claimed({"data": self.spy()}, self.at("08:00"), p, 5), ["CLOSED"])
+        out = self.m.cmd_tick_claimed({"data": self.spy()}, self.at("10:01"), p, 5)
+        self.assertTrue(out[-1].startswith("STATUS 10:01"))
+        out = self.m.cmd_tick_claimed({"data": self.spy()}, self.at("10:02"), p, 5)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith("DUPLICATE"))
+
+    def test_eod_no_session_on_holiday(self):
+        out = self.m.cmd_eod(self.at("16:06", day="2026-11-26"), 5, os.path.join(self.tmp.name, "j"))
+        self.assertTrue(out.startswith("NO_SESSION"))
+
+    def test_block_matches_files_exactly(self):
+        with open(FIXTURE) as f:
+            rows = json.load(f)["SPY"]
+        cum, hi, lo, now = 0.0, -1e9, 1e9, None
+        p = self.m.params_for(5)
+        for r in rows:
+            cum += r["v"]; hi = max(hi, r["h"]); lo = min(lo, r["l"])
+            now = datetime.fromisoformat(r["t"].replace("Z", "+00:00")) + timedelta(seconds=65)
+            if now.minute % 5 == 1:
+                self.m.cmd_tick({"data": {"AMEX:SPY": {"close": r["c"], "volume": cum, "high": hi, "low": lo}}}, now, p, 5)
+        out_dir = os.path.join(self.tmp.name, "j")
+        eod = self.m.cmd_eod(now, 5, out_dir)
+        first, block = eod.split("\n", 1)
+        self.assertTrue(first.startswith("PUSH VWAP scanner 2026-11-02 done: 2 alert(s)"))
+        md = read(os.path.join(out_dir, "2026-11-02.md")).rstrip("\n")
+        csv_rows = [l for l in read(os.path.join(out_dir, "alerts.csv")).splitlines() if l.startswith("2026-11-02,")]
+        expect = "\n".join(["=== VWAP JOURNAL 2026-11-02 PUSHED=no ===", md, "=== VWAP CSV ROWS ===", *csv_rows, "=== VWAP END ==="])
+        self.assertEqual(block, expect)
+        self.assertEqual(len(csv_rows), 2)
+
+
 class TestGrading(unittest.TestCase):
     def setUp(self):
         import tv_vwap_scanner
