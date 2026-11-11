@@ -33,3 +33,4 @@ date,alert_time_et,ticker,setup,direction,entry,vwap,stop,target_1r,target_2r,re
 2026-11-06,15:56,INTC,break_down,short,55.79,55.88,56.43,55.15,54.51,3.77,open,0.0,0.0,None
 2026-11-09,13:32,COIN,bounce_up,long,136.5,135.86,135.81,137.19,137.88,1.06,2R,3.42,0.0,0.13
 2026-11-10,14:51,COIN,break_up,long,131.71,131.35,131.3,132.12,132.53,1.38,stop,0.0,1.29,-1.26
+2026-11-11,14:31,INTC,break_up,long,62.85,62.61,62.47,63.24,63.62,2.33,stop,0.21,1.01,-1.14
