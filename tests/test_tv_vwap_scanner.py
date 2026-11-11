@@ -388,6 +388,22 @@ class TestOneCallHelpers(Base):
         self.assertEqual(len(csv_rows), 2)
 
 
+class TestBadVolume(Base):
+    def test_inflated_first_volume_self_heals(self):
+        # First snapshot has an extra digit in volume (10x). Before the fix the
+        # ticker never produced a bar again; now it re-anchors on the next tick.
+        p = self.m.params_for(5)
+        T = datetime(2026, 11, 3, 14, 31, 10, tzinfo=timezone.utc)
+        snap = lambda c, v: {"data": {"AMEX:SPY": {"close": c, "volume": v, "high": c + 1, "low": c - 1}}}
+        self.m.cmd_tick(snap(100, 10_000_000), T, p, 5)              # bad: should be 1,000,000
+        out = self.m.cmd_tick(snap(100.5, 1_200_000), T + timedelta(minutes=5), p, 5)
+        self.assertTrue(any(l.startswith("WARN SPY: volume went down") for l in out))
+        self.m.cmd_tick(snap(101, 1_500_000), T + timedelta(minutes=10), p, 5)
+        st = self.m.load_state()["symbols"]["AMEX:SPY"]
+        self.assertEqual(len(st["bars"]), 1)
+        self.assertLessEqual(st["seed"][1], 1_200_000)
+
+
 class TestGrading(unittest.TestCase):
     def setUp(self):
         import tv_vwap_scanner

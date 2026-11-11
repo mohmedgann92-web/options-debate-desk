@@ -192,6 +192,20 @@ def init_symbol(snap: dict, now: datetime, pending_seed: dict | None) -> dict:
     }
 
 
+def resync(st: dict, snap: dict, now: datetime) -> None:
+    """Re-anchor a ticker on the current quote. The seed (volume before the
+    first bar) can't exceed what has traded since, so shrink it if a bad
+    value inflated it; VWAP itself is unchanged by the rescale."""
+    V = float(snap["volume"])
+    traded = sum(b["v"] for b in st["bars"])
+    room = max(V - traded, 1.0)
+    if st["seed"][1] > room:
+        f = room / st["seed"][1]
+        st["seed"] = [x * f for x in st["seed"]]
+    st.update(last_t=now.isoformat(), last_c=float(snap["close"]), last_v=V,
+              last_h=float(snap["high"]), last_l=float(snap["low"]))
+
+
 def snapshot_to_bars(st: dict, snap: dict, now: datetime, interval: int = 1) -> list[Bar]:
     """New `interval`-minute bars covering the time since the previous snapshot."""
     c, V = float(snap["close"]), float(snap["volume"])
@@ -256,6 +270,13 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
         if st is None:
             st = init_symbol(snap, now, state["seeds"].get(short(sym)))
             state["symbols"][sym] = st
+            continue
+        if float(snap["volume"]) < st["last_v"]:
+            # Cumulative volume can't fall. The stored value is bad (e.g. a
+            # mistyped first snapshot) and would freeze this ticker all day,
+            # so re-anchor on the current quote instead.
+            lines.append(f"WARN {short(sym)}: volume went down ({st['last_v']:.0f} -> {float(snap['volume']):.0f}), re-anchored")
+            resync(st, snap, now)
             continue
         new = snapshot_to_bars(st, snap, now, interval)
         if not new:
