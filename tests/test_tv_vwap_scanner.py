@@ -404,6 +404,32 @@ class TestBadVolume(Base):
         self.assertLessEqual(st["seed"][1], 1_200_000)
 
 
+class TestSameTickCooldown(Base):
+    def test_split_bars_in_one_tick_alert_once_per_kind(self):
+        # Feed a tick whose gap splits into 2 bars that both satisfy the same
+        # setup; only one alert of that kind may come out of the tick.
+        from vwap_signals import Signal
+        p = self.m.params_for(5)
+        calls = []
+
+        def fake_detect(sym, bars, params, seed):
+            calls.append(len(bars))
+            return [Signal(symbol=sym, kind="bounce_up", direction="long", bar_time=bars[-1].t.isoformat(),
+                           price=10, vwap=10, sd=0.1, distance_pct=0, rel_volume=2, buffer=0.1, stop=9,
+                           risk_per_share=1, targets=[11, 12])]
+        orig = self.m.detect
+        self.m.detect = fake_detect
+        try:
+            T = datetime(2026, 11, 3, 15, 1, 10, tzinfo=timezone.utc)
+            snap = lambda c, v: {"data": {"NASDAQ:INTC": {"close": c, "volume": v, "high": c + 1, "low": c - 1}}}
+            self.m.cmd_tick(snap(10, 1000), T, p, 5)
+            out = self.m.cmd_tick(snap(10.5, 3000), T + timedelta(minutes=10), p, 5)   # 2 bars
+        finally:
+            self.m.detect = orig
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sum(l.startswith("ALERT") for l in out), 1)
+
+
 class TestGrading(unittest.TestCase):
     def setUp(self):
         import tv_vwap_scanner

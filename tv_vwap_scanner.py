@@ -283,12 +283,16 @@ def cmd_tick(payload: dict, now: datetime, params: Params, interval: int = 1) ->
             continue
         bars = [bar_from_dict(b) for b in st["bars"]]
         seed = tuple(st["seed"])
+        seen: dict[str, datetime] = {}   # same-tick cooldown: a late tick splits into several bars
         for b in new:
             bars.append(b)
             for s in detect(short(sym), bars, params, seed):
                 last = st["fired"].get(s.kind)
                 if last and b.t - datetime.fromisoformat(last) < COOLDOWN:
                     continue
+                if s.kind in seen and b.t - seen[s.kind] < COOLDOWN:
+                    continue
+                seen[s.kind] = b.t
                 candidates.append((sym, st, b.t, s))
         if len(bars) > MAX_BARS:         # fold the oldest bars into the seed
             for old in bars[:-MAX_BARS]:
